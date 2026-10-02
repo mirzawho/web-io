@@ -1,0 +1,3 @@
+[test]
+# Runs before the test files are loaded, so src/helpers/config.ts sees NODE_ENV=test.
+preload = ["./tests/preload.ts"]

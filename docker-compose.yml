@@ -1,0 +1,86 @@
+services:
+  web-io:
+    build:
+      context: .
+    image: web-io:latest
+    # Optional: copy .env.example to .env to override the values below.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Fixed inside the container so the port mapping below always matches.
+      PORT: 3000
+      # Search goes over the internal Docker network, using the service name as host.
+      SEARXNG_URL: http://searxng:8080
+      # Response cache: the redis service below, reached the same way. Set CACHE_DRIVER to
+      # "memory" or "none" (and drop the redis service) for a stack without Redis.
+      CACHE_DRIVER: redis
+      REDIS_URL: redis://redis:6379
+      SEARCH_TIMEOUT: 30000
+      GOOGLE_HEADLESS: "true"
+      # Chromium cannot use its sandbox in a container.
+      PUPPETEER_NO_SANDBOX: "true"
+      PUPPETEER_TIMEOUT: 30000
+      PAGE_LOAD_TIMEOUT: 30000
+      MAX_RESULTS: 10
+      MAX_CONTENT_LENGTH: 120000
+    ports:
+      - "${PORT:-3000}:3000"
+    # Chromium forks helper processes; init reaps them if the container is stopped.
+    init: true
+    restart: unless-stopped
+    # Ordering only: the API answers SEARCH_UNAVAILABLE while SearXNG is still coming up.
+    # Redis is optional at any time: a miss just means the request is not cached.
+    depends_on:
+      - searxng
+      - redis
+    healthcheck:
+      test:
+        - CMD
+        - bun
+        - -e
+        - "const response = await fetch('http://127.0.0.1:3000/api/v1/health'); process.exit(response.ok ? 0 : 1);"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  searxng:
+    image: searxng/searxng:latest
+    restart: unless-stopped
+    environment:
+      # server.secret_key; override it in .env (see .env.example).
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-change-me-searxng-secret}
+      # Public base URL, used for the links on SearXNG's own pages.
+      SEARXNG_BASE_URL: ${SEARXNG_BASE_URL:-http://localhost:18080/}
+    volumes:
+      # Only settings.yml is shared; the entrypoint's generated files stay in the container.
+      - ./settings.yml:/etc/searxng/settings.yml:rw
+    # Convenience for local development: SearXNG's own interface on the host. The API never
+    # uses this port - it talks to http://searxng:8080 over the internal network - so the
+    # host port is free to change when 8080 is taken.
+    ports:
+      - "${SEARXNG_PORT:-18080}:8080"
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+
+  # Response cache for the API. Same image/version as the Kubernetes manifest below.
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # The cache is disposable, so persistence is off: no RDB snapshots, no AOF.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test:
+        - CMD
+        - redis-cli
+        - ping
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

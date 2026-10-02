@@ -1,0 +1,18 @@
+# SearXNG runs as its own container; everything not listed here comes from the defaults
+# baked into the official image.
+use_default_settings: true
+
+server:
+  # Replaced by SEARXNG_SECRET in Docker. A real secret never belongs in git: generate one
+  # with `openssl rand -hex 32` and put it in .env.
+  secret_key: "change-me-searxng-secret"
+  # The rate limiter keeps its state in Valkey. This setup does not run Valkey, so it stays
+  # off; turning it on would mean adding that service to docker-compose.yml.
+  limiter: false
+
+search:
+  # The Bun API reads the JSON format; html stays available for a human looking at the
+  # SearXNG interface.
+  formats:
+    - html
+    - json

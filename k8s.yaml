@@ -1,0 +1,289 @@
+# Minimal deployment: two API replicas behind a ClusterIP service, a single-replica SearXNG
+# (the search backend) and a single Redis for the response cache. No Ingress or autoscaler.
+# SearXNG needs a ConfigMap (its settings.yml, which enables the JSON format the API reads)
+# and a Secret (its server.secret_key); everything else is environment variables.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-io
+  labels:
+    app: web-io
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web-io
+  template:
+    metadata:
+      labels:
+        app: web-io
+    spec:
+      # Chromium is killed rather than waited for: in-flight requests are lost anyway.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: web-io
+          image: web-io:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: PORT
+              value: "3000"
+            # Chromium runs headless, and cannot use its sandbox in a container.
+            - name: GOOGLE_HEADLESS
+              value: "true"
+            - name: PUPPETEER_NO_SANDBOX
+              value: "true"
+            - name: PUPPETEER_TIMEOUT
+              value: "30000"
+            # Search. SearXNG runs in this same manifest (below) and is reached by its
+            # Service name over the cluster network, exactly as in docker-compose.yml.
+            - name: SEARXNG_URL
+              value: http://searxng:8080
+            - name: SEARCH_TIMEOUT
+              value: "30000"
+            - name: PAGE_LOAD_TIMEOUT
+              value: "30000"
+            - name: MAX_RESULTS
+              value: "10"
+            - name: MAX_CONTENT_LENGTH
+              value: "120000"
+            # Response cache; the Service at the bottom of this file is named redis. Change
+            # CACHE_DRIVER to "memory" or "none" to drop the Redis Deployment entirely.
+            - name: CACHE_DRIVER
+              value: redis
+            - name: REDIS_URL
+              value: redis://redis:6379
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          resources:
+            # One idle service is small; a running Chromium is not. Requests cover the
+            # idle case, limits keep a few concurrent renders from eating the node.
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-io
+  labels:
+    app: web-io
+spec:
+  type: ClusterIP
+  selector:
+    app: web-io
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+# SearXNG: the search backend. The API reaches it over HTTP as http://searxng:8080 (the
+# Service below), the same way docker-compose.yml wires the two together.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: searxng-settings
+  labels:
+    app: searxng
+data:
+  # The same minimal settings.yml that Compose bind-mounts. The important part is `json`
+  # among the formats: the API reads SearXNG's JSON, and the image's own default enables
+  # only html. `use_default_settings: true` keeps everything else from the image.
+  settings.yml: |
+    use_default_settings: true
+
+    server:
+      # Overridden at runtime by SEARXNG_SECRET (the Secret below); this value is only a
+      # placeholder so the file is valid on its own.
+      secret_key: "change-me-searxng-secret"
+      # The rate limiter keeps its state in Valkey, which this manifest does not run.
+      limiter: false
+
+    search:
+      formats:
+        - html
+        - json
+---
+# server.secret_key. SearXNG reads SEARXNG_SECRET and it wins over settings.yml, so the
+# placeholder in the ConfigMap above never has to be edited. Replace the value below before
+# applying, or apply the manifest and then overwrite the Secret with a generated key:
+#   kubectl create secret generic searxng-secret \
+#     --from-literal=SEARXNG_SECRET="$(openssl rand -hex 32)" \
+#     --dry-run=client -o yaml | kubectl apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: searxng-secret
+  labels:
+    app: searxng
+type: Opaque
+stringData:
+  SEARXNG_SECRET: change-me-searxng-secret
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: searxng
+  labels:
+    app: searxng
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: searxng
+  template:
+    metadata:
+      labels:
+        app: searxng
+    spec:
+      containers:
+        - name: searxng
+          image: searxng/searxng:latest
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: SEARXNG_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: searxng-secret
+                  key: SEARXNG_SECRET
+            # Public base URL, used for the links on SearXNG's own pages.
+            - name: SEARXNG_BASE_URL
+              value: http://searxng:8080/
+          volumeMounts:
+            # Only settings.yml is mounted; the entrypoint's generated files stay in the
+            # container. subPath keeps the image's /etc/searxng directory in place.
+            - name: settings
+              mountPath: /etc/searxng/settings.yml
+              subPath: settings.yml
+            # SearXNG's own cache; disposable, so an emptyDir is enough.
+            - name: cache
+              mountPath: /var/cache/searxng
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          # The entrypoint chowns its config and cache directories, which needs root and
+          # these capabilities; everything else is dropped, as in docker-compose.yml.
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - CHOWN
+                - SETGID
+                - SETUID
+                - DAC_OVERRIDE
+      volumes:
+        - name: settings
+          configMap:
+            name: searxng-settings
+        - name: cache
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: searxng
+  labels:
+    app: searxng
+spec:
+  type: ClusterIP
+  selector:
+    app: searxng
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+# Response cache. One replica is enough for a cache and keeps the API's view of it
+# consistent; nothing is persisted, so a restart just starts with an empty cache.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  labels:
+    app: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          # The cache is disposable: no RDB snapshots, no append-only file.
+          args: ["redis-server", "--save", "", "--appendonly", "no"]
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  labels:
+    app: redis
+spec:
+  type: ClusterIP
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
