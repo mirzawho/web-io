@@ -22,7 +22,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: web-io
-          image: web-io:latest
+          image: ghcr.io/mirzawho/web-io:latest
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

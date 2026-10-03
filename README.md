@@ -785,6 +785,20 @@ docker build -t web-io .
 docker run --rm -p 3000:3000 -e PUPPETEER_NO_SANDBOX=true -e SEARXNG_URL=http://host.docker.internal:18080 web-io
 ```
 
+### Published image
+
+Every push to `main` publishes the image to GitHub Container Registry, so it can be pulled
+without building it locally:
+
+```bash
+docker pull ghcr.io/mirzawho/web-io:latest
+docker run --rm -p 3000:3000 -e PUPPETEER_NO_SANDBOX=true -e SEARXNG_URL=http://host.docker.internal:18080 ghcr.io/mirzawho/web-io:latest
+```
+
+Tags: `latest` on `main`, `sha-<short>` for every published commit, and `1.2.3` / `1.2` when a
+`v1.2.3` tag is pushed. The package is private by default; make it public in the repository's
+**Packages** settings, or authenticate with `docker login ghcr.io` first.
+
 ## Kubernetes
 
 ```bash
@@ -792,7 +806,8 @@ kubectl apply -f k8s.yaml
 ```
 
 This creates a two-replica Deployment and a ClusterIP Service on port 80 targeting 3000.
-Push `web-io:latest` to a registry your cluster can reach, or set `image` to your tag. It
+The Deployment pulls `ghcr.io/mirzawho/web-io:latest`, the image CI publishes, so the cluster
+needs no local build; set `image` to another tag or registry if you prefer. It
 also creates a single-replica Redis Deployment and a ClusterIP Service named `redis` (same
 `redis:7-alpine` image as Compose), selected with `CACHE_DRIVER=redis` and reached at
 `redis://redis:6379`. To run without Redis, set `CACHE_DRIVER` to `memory` or `none` and
