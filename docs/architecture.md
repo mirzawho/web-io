@@ -54,6 +54,7 @@ src/
 │   ├── memory.ts                 the in-process backend
 │   └── index.ts                  the module's public exports
 ├── middlewares/        route-level middleware, one file per concern
+│   ├── auth.ts                   requireToken → refuses a request without the access token
 │   ├── cache.ts                  cache({ ttl }) → replays and stores successful responses
 │   └── validate.ts               validate(schema) → rejects a body the schema refuses
 ├── helpers/            small reusable pieces
@@ -61,6 +62,7 @@ src/
 │   ├── response.ts               response envelope, response codes, request timer
 │   ├── error.ts                  AppError carrying an HTTP status and a code
 │   ├── debug.ts                  appends failures to debug.txt when DEBUG is on
+│   ├── token.ts                  the access token: guest mode, the token file, the comparison
 │   ├── url.ts                    URL validation and SSRF checks
 │   ├── content-cleaner.ts        noise removal and main content detection
 │   └── markdown.ts               DOM → Markdown serialisation
@@ -71,6 +73,9 @@ src/
 ├── server.ts           exports the configured Express `app` (never listens)
 └── index.ts            entrypoint: starts the app, graceful shutdown
 ```
+
+`bin/generate-token` sits outside `src/` on purpose: it is an operator's tool, not part of the
+running service, and the service never invokes it.
 
 The dependency direction is one-way: `controllers → instance → services → helpers`, and
 `middlewares → cache → helpers`. `routes.api.ts` is the only module that knows both a middleware and a
@@ -89,7 +94,8 @@ the controller's job, so the HTTP shape lives in exactly one layer.
 POST /api/v1/website/search  {"q":"bun"}
   │
   ├─ server.ts        app.use(responseMiddleware), express.json(), then app.use("/api/v1", router)
-  ├─ routes.api.ts    router.post("/website/search", middlewares.validate(schema), middlewares.cache({ttl:120}), search)
+  ├─ routes.api.ts    router.post("/website/search", middlewares.auth, middlewares.validate(schema), middlewares.cache({ttl:120}), search)
+  ├─ middlewares/auth.ts      refuses a request without the token, once this instance has one
   ├─ middlewares/validate.ts  rejects a body the schema refuses with 400 VALIDATION_ERROR
   ├─ middlewares/cache.ts     serves a stored 200, or stores the 200 that follows
   ├─ controllers/search.ts  reads q/page/limit/sources/language, already validated and defaulted
@@ -115,6 +121,7 @@ statements inside the controller:
 // routes.api.ts
 router.post(
   "/website/search",
+  middlewares.auth,
   middlewares.validate({
     q: { type: "string", min: 1, trim: true },
     page: { type: "number", integer: true, min: 1, max: MAX_PAGE, optional: true, default: 1 },
@@ -257,6 +264,50 @@ Two things about it are deliberate:
   `responseMiddleware`, because Swagger UI answers with HTML, JavaScript and static assets
   rather than an API envelope. `/mcp` is deliberately absent from the document: MCP speaks
   JSON-RPC, and an OpenAPI path describes a REST operation.
+
+## Access token
+
+The token is opt-in in the same sense the docs and MCP are, but its default is different: with
+nothing configured the instance answers **as a guest**, and that is a supported way to run it. The
+requirement appears when someone creates it, with `bin/generate-token`, which writes the token's
+sha256 to `AUTH_TOKEN_FILE` (`bin/generate-token --revoke` removes it again).
+
+```
+bin/generate-token ──→ .cache/token (sha256, 0600) ──┐
+                                                     ├──→ helpers/token.ts ──→ isAuthorized()
+AUTH_TOKEN (env, read once) ─────────────────────────┘         │
+                                                               ├─ REST: middlewares/auth.ts → 401 UNAUTHORIZED
+                                                               └─ MCP:  routes.mcp.ts     → 401 + WWW-Authenticate
+```
+
+- **One rule, two edges.** `helpers/token.ts` owns the whole decision: no token configured means
+  every request passes, and once there is one, a presented `Authorization: Bearer <token>` or
+  `X-API-Key: <token>` is compared against the sha256 the instance requires. The REST middleware
+  and the MCP route only differ in how they report a refusal — the envelope, or a JSON-RPC error
+  with `WWW-Authenticate` — so neither of them decides who is allowed in.
+- **Only hashes.** The token is printed once, at generation, and never stored; the file holds its
+  sha256, so a copy of that file is not a credential. Comparison is `timingSafeEqual` over the two
+  digests.
+- **Read per request, not at startup.** `AUTH_TOKEN` is hashed once and remembered (it cannot
+  change while the process runs), but the file is read on every request. That is what makes
+  `docker compose exec web-io bin/generate-token` take effect on a running instance, and what makes
+  revoking immediate.
+- **Two sources, one winner.** A non-empty `AUTH_TOKEN` is the token and the file is ignored, which
+  is how a deployment keeps the secret in Kubernetes rather than on a volume. Empty leaves the file
+  in charge.
+- **`/health` is outside the gate.** It is the liveness probe; a probe that needed a credential
+  could not tell a healthy instance from a misconfigured one. It reports liveness only, and
+  everything that searches or reads a page is gated.
+- **Nothing is logged.** `helpers/debug.ts` already redacts a field whose name looks like a
+  credential, and the gate never writes the presented value anywhere else.
+- **The gate runs first.** In `routes.api.ts` it sits before `validate` and `cache`, so a request
+  without a token costs neither a validation pass nor a Redis round-trip.
+
+`tests/auth.test.ts` covers it through the real app: guest mode with no file, an empty file and an
+unreadable one; a required token accepted as either header and refused when wrong, absent or sent
+without a scheme; `/health` staying open; a bad token never reaching the schema; the file being read
+per request so generating and revoking both take effect without a restart; `AUTH_TOKEN` winning over
+the file; and the same rule on `/mcp`, where the refusal is a JSON-RPC error instead.
 
 ## Response cache
 
@@ -564,9 +615,9 @@ export const browser = new Browser(config);
 export const page = new Page(browser, config);
 
 // routes.api.ts — the schema is declared inline; only the order matters here.
-router.post("/website/search", middlewares.validate({ /* q, page, limit, sources, language */ }), middlewares.cache({ ttl: 120 }), search);
-router.get("/website/search/sources", middlewares.cache({ ttl: 120 }), searchSources);
-router.post("/website/fetch", middlewares.validate({ /* url, driver, autoRedirect */ }), middlewares.cache({ ttl: 120 }), get);
+router.post("/website/search", middlewares.auth, middlewares.validate({ /* q, page, limit, sources, language */ }), middlewares.cache({ ttl: 120 }), search);
+router.get("/website/search/sources", middlewares.auth, middlewares.cache({ ttl: 120 }), searchSources);
+router.post("/website/fetch", middlewares.auth, middlewares.validate({ /* url, driver, autoRedirect */ }), middlewares.cache({ ttl: 120 }), get);
 
 // controllers/get.ts
 import { page } from "../instance";
@@ -622,6 +673,7 @@ never slow down or break a request, and the HTTP body never carries any of it.
 | 400    | `VALIDATION_ERROR`                    | `middlewares/validate.ts` |
 | 400    | `INVALID_PARAMETER`                   | `services/search.ts`      |
 | 400    | `INVALID_BODY`                        | `server.ts` (body-parser) |
+| 401    | `UNAUTHORIZED`                        | `middlewares/auth.ts`     |
 | 404    | `NOT_FOUND`                           | `server.ts`               |
 | 502    | `BROWSER_FAILED`                      | `services/browser.ts`     |
 | 502    | `SEARCH_FAILED`                       | `services/search.ts`      |
@@ -642,11 +694,16 @@ never slow down or break a request, and the HTTP body never carries any of it.
   real Chromium, a persistent profile and the browser's own User-Agent. Searching does not
   touch the browser at all, so there is nothing to disguise or work around on that path.
 - **No internals in responses.** Stack traces stay in the server log.
+- **Access token.** `bin/generate-token` creates a 256-bit token and stores only its sha256, mode
+  0600, outside the repository (`.cache/` is ignored). Every request but `/health` must present it
+  once one exists, and comparison is constant-time. The token is never logged, and neither is the
+  hash.
 - **Input bounds.** `page` ≤ 20, `limit` ≤ `MAX_RESULTS`, `content` ≤
   `MAX_CONTENT_LENGTH`, and every Puppeteer call has a timeout.
 - **Resource limits.** Assets are not downloaded, pages are always closed, and one
   Chromium process serves all requests.
-- **Secrets.** Only `.env.example` is committed; `.env` is ignored.
+- **Secrets.** Only `.env.example` is committed; `.env` is ignored. The generated token lives in
+  `.cache/`, which is ignored too, and only ever as a hash.
 
 ## Docker and the search backend
 
@@ -738,9 +795,14 @@ errors in `data`), every other validation failure, the SSRF refusals on `/websit
 error-middleware paths. `tests/routes.mcp.test.ts` does the same for the MCP interface, driving
 the real `/mcp` route with the SDK's own client and stubbing only the services it reaches.
 `tests/swagger.test.ts` asserts the document against the routes it describes — the operations,
-the tags, the request bounds read from the same constants, and the examples — and that the
+the tags, the request bounds read from the same constants, the security schemes and the 401 the
+authenticated operations declare, and the examples — and that the
 generated Swagger UI script is valid JavaScript pointing at `/docs/openapi.json`.
-`tests/preload.ts` sets `NODE_ENV=test` (and turns the docs and MCP off) so the request log stays quiet and
+`tests/auth.test.ts` drives the real app with a token configured and without one: guest mode,
+both accepted headers, a refusal that never reaches the schema, `/health` staying open, and the
+token file being read per request so generating and revoking both take effect on a running
+instance. `tests/preload.ts` sets `NODE_ENV=test` (and turns the docs and MCP off, with no token
+configured) so the request log stays quiet and
 no test depends on the developer's `.env`. The whole suite runs in well under a second.
 
 What the suite deliberately does **not** cover is the real backends: a live search backend, a real
@@ -769,7 +831,11 @@ so it is not a second error system and the controllers keep no validation of the
 and hands over to the existing response layer, with `cache/` holding the driver
 selection and one backend per file behind one `get`/`set` pair rather than a cache
 repository, provider, adapter, factory or interface — there is nothing to configure beyond
-`CACHE_DRIVER` and nothing to resolve. Duplication is
+`CACHE_DRIVER` and nothing to resolve. The token follows it: `middlewares/auth.ts` is one
+`RequestHandler`, `helpers/token.ts` is the rule it applies, and the whole state is one file on
+disk that may not exist. There is no user table, no session store, no JWT, no refresh token, no
+scopes and no roles, because the question this API has to answer is "is this the token this
+deployment generated?" and nothing else. Duplication is
 accepted where it is cheaper than the abstraction: the two services map navigation
 timeouts in two three-line `catch` blocks rather than sharing a helper that would need its
 own tests. MCP follows the same rule: `routes.mcp.ts` is the only file that knows the SDK, its

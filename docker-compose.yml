@@ -24,6 +24,17 @@ services:
       PAGE_LOAD_TIMEOUT: 30000
       MAX_RESULTS: 10
       MAX_CONTENT_LENGTH: 120000
+      # Access token. Leave AUTH_TOKEN unset to answer as a guest, and generate a token inside
+      # the running container with `docker compose exec web-io bin/generate-token`; it is
+      # written to AUTH_TOKEN_FILE below and takes effect without a restart. Setting AUTH_TOKEN
+      # here (or in .env) requires that token instead, which is the way to keep it in a secret
+      # store rather than in the volume.
+      AUTH_TOKEN_FILE: .cache/token
+    volumes:
+      # Persists .cache across `docker compose up --build`, which recreates the container: the
+      # access token lives here (AUTH_TOKEN_FILE), and so does the browser profile
+      # (GOOGLE_PROFILE_DIR), which otherwise loses its cookies on every rebuild.
+      - cache:/app/.cache
     ports:
       - "${PORT:-3000}:3000"
     # Chromium forks helper processes; init reaps them if the container is stopped.
@@ -84,3 +95,8 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
+
+volumes:
+  # The API's .cache directory: the access token and the browser profile. Named rather than
+  # anonymous so both survive a rebuild.
+  cache:

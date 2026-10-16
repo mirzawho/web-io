@@ -5,6 +5,7 @@ import type { RequestHandler, Response } from "express";
 import * as z from "zod/v4";
 
 import { config } from "./helpers/config";
+import { isAuthorized } from "./helpers/token";
 import { parseHttpUrl } from "./helpers/url";
 import { page, searchService } from "./instance";
 import { MAX_PAGE, SOURCE_PATTERN } from "./routes.api";
@@ -139,6 +140,24 @@ const methodNotAllowed: RequestHandler = (_req, res) => {
 };
 
 /**
+ * The token gate, in the JSON-RPC vocabulary rather than the REST envelope.
+ *
+ * MCP's own answer to "who are you" is `401` with a `WWW-Authenticate` header, so that is what
+ * an unauthenticated request gets - an MCP client understands it and can be configured with the
+ * token. The check itself is the same one the REST routes use: no token configured means every
+ * request passes, and once there is one, `Authorization: Bearer <token>` or
+ * `X-API-Key: <token>` is required.
+ */
+const requireToken: RequestHandler = async (req, res, next) => {
+  if (await isAuthorized(req.get("authorization"), req.get("x-api-key"))) return next();
+
+  res.setHeader("WWW-Authenticate", 'Bearer realm="web-io"');
+  jsonRpcError(res, 401, -32001, "A valid access token is required.");
+
+  return undefined;
+};
+
+/**
  * One server and one transport per request, because a McpServer is bound to a single transport
  * for its lifetime and stateless mode keeps no session. The transport answers through the
  * Express response the application already owns: nothing here listens, and there is no second
@@ -167,6 +186,6 @@ const handleRequest: RequestHandler = async (req, res) => {
 /** Mounted at /mcp by server.ts, and only when config.mcp.enabled. */
 export const mcpRoutes = Router();
 
-mcpRoutes.post("/", handleRequest);
-mcpRoutes.get("/", methodNotAllowed);
-mcpRoutes.delete("/", methodNotAllowed);
+mcpRoutes.post("/", requireToken, handleRequest);
+mcpRoutes.get("/", requireToken, methodNotAllowed);
+mcpRoutes.delete("/", requireToken, methodNotAllowed);

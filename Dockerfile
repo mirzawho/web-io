@@ -21,9 +21,10 @@ ENV NODE_ENV=production \
     PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 # chromium pulls in every shared library it needs; the extra fonts keep pages that
-# measure text with canvas from failing to render.
+# measure text with canvas from failing to render. openssl is what bin/generate-token
+# prefers for random bytes and for sha256.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates chromium fonts-liberation \
+    && apt-get install -y --no-install-recommends ca-certificates chromium fonts-liberation openssl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -31,6 +32,10 @@ WORKDIR /app
 COPY --from=dependencies /app/node_modules ./node_modules
 COPY package.json ./
 COPY src ./src
+# The token script, so `docker compose exec web-io bin/generate-token` works in the running
+# container. It needs only bash, coreutils and (for `openssl rand`) openssl, all of which the
+# base image or the packages above already provide.
+COPY bin ./bin
 
 # The runtime user owns the app directory, so Chromium can write its profile into .cache/ and
 # DEBUG=true can write debug.txt.

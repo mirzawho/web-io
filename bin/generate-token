@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# Generates, shows and revokes the access token this instance requires.
+#
+#   bin/generate-token            generate a token, store its hash, print the token once
+#   bin/generate-token --show     print the token currently in effect (or report guest mode)
+#   bin/generate-token --revoke   delete the token file, so the instance answers as a guest
+#   bin/generate-token --help     this text
+#
+# The token itself is printed exactly once, when it is generated: only its sha256 is written to
+# the token file, so the file is not a usable credential and there is nothing to recover from it
+# afterwards. Store the printed value where the caller keeps secrets.
+#
+# The file lives at AUTH_TOKEN_FILE (default .cache/token) - the same variable the service reads
+# at request time - so generating a token takes effect immediately, without a restart. Set
+# AUTH_TOKEN in the environment instead to keep the token in a secret store rather than on disk;
+# that variable wins over this file.
+set -euo pipefail
+
+# The token file, relative to the project root rather than to the caller's directory, so the
+# script behaves the same from anywhere.
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# .env is where the service reads AUTH_TOKEN_FILE from, so the script reads it too. Only a plain
+# assignment is honoured: the point is to find the same path the service will look at, not to
+# become a shell.
+env_file="$root/.env"
+if [ -f "$env_file" ]; then
+  from_env="$(sed -n 's/^[[:space:]]*AUTH_TOKEN_FILE[[:space:]]*=[[:space:]]*//p' "$env_file" | tail -n 1 | tr -d '"'"'"'')"
+fi
+
+configured="${AUTH_TOKEN_FILE:-${from_env:-.cache/token}}"
+case "$configured" in
+  /*) token_file="$configured" ;;
+  *) token_file="$root/$configured" ;;
+esac
+
+usage() {
+  cat <<'TEXT'
+Generates, shows and revokes the access token this instance requires.
+
+  bin/generate-token            generate a token, store its hash, print the token once
+  bin/generate-token --show     report whether a token is required, and where it is stored
+  bin/generate-token --revoke   delete the token file, so the instance answers as a guest
+  bin/generate-token --help     this text
+
+The token itself is printed exactly once, when it is generated: only its sha256 is written to
+the token file, so the file is not a usable credential and there is nothing to recover from it
+afterwards. Store the printed value where the caller keeps secrets.
+
+The file lives at AUTH_TOKEN_FILE (default .cache/token) - the same variable the service reads
+at request time - so generating a token takes effect immediately, without a restart. Set
+AUTH_TOKEN in the environment instead to keep the token in a secret store rather than on disk;
+that variable wins over this file.
+TEXT
+}
+
+# A token is 32 random bytes, hex-encoded: 256 bits, which is what an API token should carry.
+# openssl is the portable source; /dev/urandom is the fallback when it is not installed.
+generate() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 32
+    return
+  fi
+
+  if [ -r /dev/urandom ]; then
+    od -An -tx1 -N32 /dev/urandom | tr -d ' \n'
+    return
+  fi
+
+  echo "generate-token: neither openssl nor /dev/urandom is available" >&2
+  exit 1
+}
+
+# sha256 of a token, exactly as src/helpers/token.ts hashes it: no salt, lowercase hex. The
+# value is passed on stdin, never as an argument, so it stays out of the process list.
+hash() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | cut -d' ' -f1
+    return
+  fi
+
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | cut -d' ' -f1
+    return
+  fi
+
+  if command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 | sed 's/^.*[[:space:]]//'
+    return
+  fi
+
+  echo "generate-token: no sha256 tool found (sha256sum, shasum or openssl)" >&2
+  exit 1
+}
+
+case "${1:-}" in
+  --help | -h)
+    usage
+    ;;
+
+  --show)
+    if [ -n "${AUTH_TOKEN:-}" ]; then
+      echo "AUTH_TOKEN is set in the environment, so it is the token in effect."
+      echo "Its value is not printed: it is a secret you already have. Unset AUTH_TOKEN to use $token_file."
+      exit 0
+    fi
+
+    if [ ! -s "$token_file" ]; then
+      echo "No token: $token_file does not exist."
+      echo "This instance answers every request as a guest. Run bin/generate-token to change that."
+      exit 0
+    fi
+
+    echo "A token is required, and its sha256 is stored at $token_file."
+    echo "The token itself was printed when it was generated and is not recoverable from the file."
+    echo "To replace it, run bin/generate-token again; to remove it, run bin/generate-token --revoke."
+    ;;
+
+  --revoke | --delete | --remove)
+    if [ -n "${AUTH_TOKEN:-}" ]; then
+      echo "AUTH_TOKEN is set in the environment, so removing $token_file would not lift the requirement." >&2
+      echo "Unset AUTH_TOKEN, then run this again." >&2
+      exit 1
+    fi
+
+    if [ ! -e "$token_file" ]; then
+      echo "Nothing to revoke: $token_file does not exist."
+      exit 0
+    fi
+
+    rm -f "$token_file"
+    echo "Revoked. $token_file is gone, so this instance answers as a guest again."
+    echo "An already-issued token stops working as soon as the file is gone: no restart needed."
+    ;;
+
+  "")
+    # The previous token is replaced, not appended to: one instance has exactly one token, so
+    # generating a new one is what invalidates the old one.
+    token="$(generate)"
+
+    mkdir -p "$(dirname "$token_file")"
+    # 0600: the file holds a hash rather than the token, but there is no reason for anyone else
+    # to read it. `umask` covers the moment between creation and chmod.
+    (umask 077 && printf '%s\n' "$(printf '%s' "$token" | hash)" >"$token_file")
+    chmod 600 "$token_file"
+
+    echo "Generated a new access token. It is shown once and only its hash is stored:"
+    echo
+    echo "  $token"
+    echo
+    echo "Stored: $token_file (sha256, mode 600)."
+    if [ -n "${AUTH_TOKEN:-}" ]; then
+      echo
+      echo "Note: AUTH_TOKEN is set in this environment and wins over that file, so the token above"
+      echo "is not the one this instance requires until AUTH_TOKEN is unset."
+    else
+      echo "It is in effect now, with no restart. Send it as:"
+      echo
+      echo "  Authorization: Bearer $token"
+      echo "  X-API-Key: $token"
+      echo
+      echo "In Docker:  docker compose exec web-io bin/generate-token"
+    fi
+    ;;
+
+  *)
+    echo "generate-token: unknown option '$1'" >&2
+    echo >&2
+    usage >&2
+    exit 1
+    ;;
+esac

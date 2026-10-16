@@ -282,6 +282,59 @@ describe("the OpenAPI document", () => {
   test("points at a relative server, so no host name is baked in", () => {
     expect(openApiDocument.servers.map((server) => server.url)).toEqual(["/api/v1"]);
   });
+
+  test("declares the two ways to send the access token, and requires one on every operation but health", () => {
+    const schemes = openApiDocument.components.securitySchemes;
+    // The document is a plain literal, so the operations are read through its own type: the
+    // optional keys this test is about (`security`, `401`) are absent from the inferred one.
+    const paths = openApiDocument.paths as Record<
+      string,
+      Record<string, { security?: unknown; responses: Record<string, unknown> }>
+    >;
+
+    expect(Object.keys(schemes).sort()).toEqual(["ApiKeyAuth", "BearerAuth"]);
+    expect(schemes.BearerAuth).toMatchObject({ type: "http", scheme: "bearer" });
+    expect(schemes.ApiKeyAuth).toMatchObject({ type: "apiKey", in: "header", name: "X-API-Key" });
+
+    // The requirement is declared once, at the top, so an operation that does not override it
+    // is authenticated. `[]` is how OpenAPI says "this one is open".
+    expect(openApiDocument.security).toEqual([{ BearerAuth: [] }, { ApiKeyAuth: [] }]);
+    expect(paths["/health"]!.get!.security).toEqual([]);
+    for (const path of ["/website/search", "/website/search/sources", "/website/fetch"]) {
+      for (const operation of Object.values(paths[path]!)) {
+        expect(operation.security).toBeUndefined();
+      }
+    }
+  });
+
+  test("documents the 401 every authenticated operation can answer with", () => {
+    const paths = openApiDocument.paths as Record<
+      string,
+      Record<string, { responses: Record<string, unknown> }>
+    >;
+    const unauthorized = openApiDocument.components.responses.Unauthorized;
+
+    for (const path of ["/website/search", "/website/search/sources", "/website/fetch"]) {
+      for (const operation of Object.values(paths[path]!)) {
+        expect(operation.responses["401"]).toEqual({ $ref: "#/components/responses/Unauthorized" });
+      }
+    }
+
+    // /health is outside the gate, so it must not advertise a 401 it can never return.
+    expect(paths["/health"]!.get!.responses["401"]).toBeUndefined();
+
+    expect(unauthorized.content["application/json"].example).toEqual({
+      ok: false,
+      status: 401,
+      code: "UNAUTHORIZED",
+      message: messages.UNAUTHORIZED,
+      meta: { took: expect.any(Number) },
+      data: null,
+    });
+    // The description has to say when this can happen at all, because a guest instance never
+    // returns it.
+    expect(unauthorized.description).toContain("guest");
+  });
 });
 
 describe("the docs do not affect the API", () => {

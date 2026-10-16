@@ -57,6 +57,24 @@ spec:
               value: redis
             - name: REDIS_URL
               value: redis://redis:6379
+            # Access token. An empty AUTH_TOKEN means the API answers as a guest; generate a
+            # token into a running replica with
+            #   kubectl exec deploy/web-io -- bin/generate-token
+            # which writes AUTH_TOKEN_FILE. That file is per-pod and dies with the pod, so for
+            # anything long-lived put the token in a Secret and swap the empty value below for
+            # the commented secretKeyRef instead:
+            #   kubectl create secret generic web-io-auth \
+            #     --from-literal=AUTH_TOKEN="$(openssl rand -hex 32)" \
+            #     --dry-run=client -o yaml | kubectl apply -f -
+            - name: AUTH_TOKEN
+              value: ""
+            # - name: AUTH_TOKEN
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: web-io-auth
+            #       key: AUTH_TOKEN
+            - name: AUTH_TOKEN_FILE
+              value: /app/.cache/token
           readinessProbe:
             httpGet:
               path: /api/v1/health

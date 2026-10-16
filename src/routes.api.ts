@@ -20,12 +20,20 @@ export const SOURCE_PATTERN = /^[a-z0-9_.-]{1,50}$/;
 
 // Health is the one domain that is not about searching anything, so it stays at the top level
 // next to the grouped ones: /health answers as soon as the process is up, and reports what it
-// is running on.
+// is running on. It deliberately takes no token: it is what a container healthcheck and a load
+// balancer probe, and a probe that needed a credential could not tell a healthy instance from
+// a misconfigured one.
 router.get("/health", health);
 
 // Endpoints are grouped by domain under their own prefix: everything that searches or reads
 // the open web lives under /website, so a later domain (/news, /images, /maps) is added the
 // same way, beside it, without touching these routes.
+//
+// Every one of them requires the access token when this instance has one. `middlewares.auth`
+// is a no-op until `AUTH_TOKEN` is set or `bin/generate-token` has written a token file, so a
+// fresh deployment answers as a guest, exactly as it did before tokens existed. It sits first
+// in the chain so a request without a token costs neither a cache round-trip nor a validation
+// pass.
 //
 // The schema is the single source of truth for what a route accepts, and it runs before the
 // cache so a body it refuses never costs a Redis round-trip. Its sanitizers and defaults write
@@ -33,6 +41,7 @@ router.get("/health", health);
 // `language` and the filled-in `page`/`limit` without checking or defaulting anything itself.
 router.post(
   "/website/search",
+  middlewares.auth,
   middlewares.validate({
     q: { type: "string", min: 1, trim: true },
     page: { type: "number", integer: true, min: 1, max: MAX_PAGE, optional: true, default: 1 },
@@ -61,12 +70,13 @@ router.post(
 // The website search sources this instance offers, read from the search backend. A literal
 // path with no parameter, so it can never be read as a search whose `sources` came from the
 // URL.
-router.get("/website/search/sources", middlewares.cache({ ttl: 120 }), searchSources);
+router.get("/website/search/sources", middlewares.auth, middlewares.cache({ ttl: 120 }), searchSources);
 
 // The public name is /website/fetch; the controller stays `get` because what it does is
 // fetch (and read) one page.
 router.post(
   "/website/fetch",
+  middlewares.auth,
   middlewares.validate({
     // Trimmed like every other string field, so surrounding whitespace is not what a request
     // fails on; what is left has to be non-empty. The scheme and the address rules are the

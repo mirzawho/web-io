@@ -62,6 +62,12 @@ successful responses.
   [MCP](https://modelcontextprotocol.io) tools — `website_search` and `website_fetch` — at
   `/mcp`. It is a second interface to this application, not a second application: the same
   process, the same port, and the same service instances the REST endpoints call.
+- **Access token (opt-in)**: a fresh instance answers as a **guest**, with no token at all. Run
+  `bin/generate-token` — in Docker, `docker compose exec web-io bin/generate-token` — and every
+  request except `/health` then has to carry the token it prints, as `Authorization: Bearer` or
+  `X-API-Key`. Only the token's sha256 is stored, and generating a new one replaces the old one,
+  so revoking is `bin/generate-token --revoke`. Both the REST API and `/mcp` are gated by the same
+  token, and neither the token nor its hash is ever logged.
 
 ## Tech stack
 
@@ -126,12 +132,15 @@ cp .env.example .env
 | `REDIS_URL`                 | *(empty)*                 | Redis URL, read only when `CACHE_DRIVER=redis`                                   |
 | `SWAGGER_ENABLED`           | `false`                   | Serve the OpenAPI document and Swagger UI at `/docs`                             |
 | `MCP_ENABLED`               | `false`                   | Serve the MCP server at `/mcp` (tools: `website_search`, `website_fetch`)        |
+| `AUTH_TOKEN`                | *(empty)*                 | An explicit access token; non-empty requires it on every request but `/health`   |
+| `AUTH_TOKEN_FILE`           | `.cache/token`            | Where `bin/generate-token` writes the token, read on every request               |
 
 Every setting is optional: a missing value takes the default above, and a misspelled boolean is
 off rather than fatal. `SEARXNG_SECRET`, `SEARXNG_BASE_URL` and `SEARXNG_PORT` are read by the
 SearXNG container and Compose rather than by the application, and
 `PUPPETEER_EXECUTABLE_PATH` is read by Puppeteer. Every other variable is read by
-`src/helpers/config.ts`, once, at startup.
+`src/helpers/config.ts`, once, at startup — except `AUTH_TOKEN_FILE`, which the token check reads
+on every request so that generating a token takes effect without a restart.
 
 The request log is printed in every environment except `NODE_ENV=test`, which is what
 the test suite uses.
@@ -583,11 +592,114 @@ Fastest Validator's own error objects, untransformed. Every other failure answer
 | Status | Codes                                                                                                                                             |
 | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `400`  | `VALIDATION_ERROR` (a route's schema refused the body), `INVALID_URL`, `UNSUPPORTED_PROTOCOL`, `INVALID_PARAMETER`, `INVALID_BODY`, `BLOCKED_URL` |
+| `401`  | `UNAUTHORIZED` (this deployment has a token and the request did not present it)                                                                   |
 | `404`  | `NOT_FOUND`                                                                                                                                       |
 | `502`  | `SEARCH_FAILED` (the search backend answered with something unusable), `PAGE_FETCH_FAILED`, `BROWSER_FAILED`                                    |
 | `503`  | `SEARCH_UNAVAILABLE` (the search backend is not running or not reachable yet)                                                                    |
 | `504`  | `TIMEOUT`                                                                                                                                         |
 | `500`  | `INTERNAL_ERROR` — unexpected failure, details stay in the server log                                                                             |
+
+## Access token
+
+A fresh instance answers **as a guest**: no token, no header, nothing to configure. That is the
+default, and it is what the API does until someone decides otherwise.
+
+Running the script is what changes it:
+
+```bash
+bin/generate-token              # generate a token, store its hash, print the token once
+bin/generate-token --show       # is a token required, and where is it stored?
+bin/generate-token --revoke     # remove it, back to guest mode
+```
+
+In Docker, the same script runs inside the container:
+
+```bash
+docker compose exec web-io bin/generate-token
+```
+
+```
+Generated a new access token. It is shown once and only its hash is stored:
+
+  d83d92f7413f35a2b7cbc7146fa3362ed083a93b7df99a269ce1f1369900c067
+
+Stored: .cache/token (sha256, mode 600).
+It is in effect now, with no restart. Send it as:
+
+  Authorization: Bearer d83d92f7413f35a2b7cbc7146fa3362ed083a93b7df99a269ce1f1369900c067
+  X-API-Key: d83d92f7413f35a2b7cbc7146fa3362ed083a93b7df99a269ce1f1369900c067
+```
+
+From that moment every request except `GET /api/v1/health` has to carry it, either way:
+
+```bash
+curl -X POST "http://localhost:3000/api/v1/website/search" \
+  -H "content-type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"q":"bun javascript runtime"}'
+
+curl -X POST "http://localhost:3000/api/v1/website/search" \
+  -H "content-type: application/json" \
+  -H "X-API-Key: $TOKEN" \
+  -d '{"q":"bun javascript runtime"}'
+```
+
+A request without it — or with the wrong one — answers `401`:
+
+```json
+{
+  "ok": false,
+  "status": 401,
+  "code": "UNAUTHORIZED",
+  "message": "A valid access token is required.",
+  "meta": { "took": 4 },
+  "data": null
+}
+```
+
+Five properties are worth stating outright:
+
+- **The token is shown exactly once.** Only its sha256 is written to the token file, so the file
+  is not a usable credential and the token cannot be recovered from it. Store the printed value
+  where you keep secrets.
+- **Generating a new token revokes the old one.** One instance has one token; `bin/generate-token`
+  replaces it rather than adding to it. `--revoke` deletes the file and the instance is a guest
+  again.
+- **No restart.** The token file is read on every request, so generating or revoking takes effect
+  immediately, on a running instance. `docker compose exec web-io bin/generate-token` is enough.
+- **`AUTH_TOKEN` wins.** Set that variable — or put it in `.env`, or in a Kubernetes Secret — to
+  keep the token in a secret store instead of on disk; it is read once, at startup, and the file
+  is ignored while it is set. Leave it empty to let the file decide.
+- **`/health` stays open.** It is what a container healthcheck and a load balancer probe call, and
+  a probe that needed a credential could not tell a healthy instance from a misconfigured one. It
+  reports liveness only; everything that searches or reads a page is gated.
+
+MCP is gated by the same token, and it says so in its own vocabulary: an unauthenticated `/mcp`
+request answers `401` with `WWW-Authenticate: Bearer` and a JSON-RPC error, which is what an MCP
+client understands and can be configured from.
+
+```json
+{ "jsonrpc": "2.0", "error": { "code": -32001, "message": "A valid access token is required." }, "id": null }
+```
+
+An MCP client sends the token as a header on the transport:
+
+```json
+{
+  "mcpServers": {
+    "web-io": {
+      "url": "http://localhost:3000/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+The gate is one middleware in front of the routes (`src/middlewares/auth.ts`) and one shared rule
+behind both edges (`src/helpers/token.ts`): `guest` when nothing is configured, a constant-time
+hash comparison when something is. It sits before the validator and the cache, so a request
+without a token costs neither. The presented value is never written anywhere — the debug log
+redacts any field named like a credential.
 
 ## API documentation (Swagger UI)
 
@@ -778,11 +890,25 @@ with `CACHE_DRIVER=redis` and `REDIS_URL=redis://redis:6379`; set `CACHE_DRIVER=
 `none` (and drop the `redis` service) for a stack without Redis. A `.env` file, if present, is
 loaded for anything Compose does not set itself.
 
+The container starts as a guest, and generating a token inside it is one command:
+
+```bash
+docker compose exec web-io bin/generate-token
+```
+
+That writes `.cache/token` in the container, which Compose keeps in the named `cache` volume —
+so the token survives `docker compose up --build`, which recreates the container. The same volume
+holds the browser profile, which otherwise loses its cookies on every rebuild. Set `AUTH_TOKEN`
+in `.env` instead to keep the token in a secret rather than in the volume.
+
 Build and run it manually if you prefer:
 
 ```bash
 docker build -t web-io .
 docker run --rm -p 3000:3000 -e PUPPETEER_NO_SANDBOX=true -e SEARXNG_URL=http://host.docker.internal:18080 web-io
+
+# Generate a token inside that container, then use it.
+docker exec -it <container> bin/generate-token
 ```
 
 ### Published image
@@ -848,6 +974,7 @@ src/
 │   ├── search.ts
 │   └── page.ts
 ├── middlewares/     route-level middleware, one file per concern
+│   ├── auth.ts          requires the access token when this instance has one
 │   ├── cache.ts         stores and replays successful responses
 │   └── validate.ts      compiles a fastest-validator schema into a middleware
 ├── helpers/         configuration, response middleware + codes, errors, URL/SSRF, cleaning
@@ -857,6 +984,7 @@ src/
 │   ├── error.ts
 │   ├── markdown.ts
 │   ├── response.ts      res.json wrapper, response codes and messages
+│   ├── token.ts         the access token: guest mode, the token file, the comparison
 │   └── url.ts
 ├── instance.ts      the shared service instances, created once
 ├── routes.api.ts    exports the router instance, mounted at /api/v1
@@ -866,6 +994,7 @@ src/
 └── index.ts         starts the app, handles graceful shutdown
 tests/               mirrors src/, runs without network or browser
 docs/architecture.md the request lifecycle, the extraction strategy and the design decisions
+bin/generate-token   generates, shows and revokes the access token
 settings.yml         SearXNG configuration, mounted into the SearXNG container
 Dockerfile           Bun + Chromium, production image
 docker-compose.yml   the API, SearXNG and Redis, .env driven

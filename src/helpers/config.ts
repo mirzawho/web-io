@@ -100,6 +100,17 @@ export const config = {
     // plain API deployment opts into by accident.
     enabled: toBool(process.env.MCP_ENABLED, false),
   },
+  auth: {
+    // An explicit token, for a deployment that keeps it in a secret store instead of on disk.
+    // Non-empty means every request except /api/v1/health must present it; empty means the
+    // token file is what decides. This is read at startup, so a token set here wins over a
+    // generated file for the life of the process.
+    token: process.env.AUTH_TOKEN?.trim() ?? "",
+    // Where `bin/generate-token` writes the token it generates. Read at request time rather
+    // than at startup, so generating a token takes effect without restarting the service.
+    // Empty, missing or unreadable means the file has nothing to say, which is guest mode.
+    tokenFile: process.env.AUTH_TOKEN_FILE?.trim() || ".cache/token",
+  },
 };
 
 export type Config = typeof config;
